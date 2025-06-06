@@ -5,138 +5,184 @@ namespace Alisalehi\LaravelLangFilesTranslator\Services;
 use Illuminate\Support\Facades\File;
 use Stichoza\GoogleTranslate\GoogleTranslate;
 use Symfony\Component\Finder\SplFileInfo;
+use RuntimeException;
 
 class TranslateService
 {
-    private string $translate_from;
-    private string $translate_to;
+    private string $sourceLanguage;
+    private string $targetLanguage;
+    private GoogleTranslate $translator;
+    private array $translationCache = [];
+    private bool $preserveParameters = true;
+    private bool $dryRun = false;
     
-    //setters
-    public function from(string $from): TranslateService
+    public function from(string $language): self
     {
-        $this->translate_from = $from;
+        $this->sourceLanguage = $language;
         return $this;
     }
     
-    public function to(string $to): TranslateService
+    public function to(string $language): self
     {
-        $this->translate_to = $to;
+        $this->targetLanguage = $language;
         return $this;
     }
     
-    public function translate(): void
+    public function dryRun(bool $dryRun = true): self
     {
-        $files = $this->getLocalLangFiles();
+        $this->dryRun = $dryRun;
+        return $this;
+    }
+    
+    public function preserveParameters(bool $preserve): self
+    {
+        $this->preserveParameters = $preserve;
+        return $this;
+    }
+    
+    public function translate(): array
+    {
+        $this->validateLanguages();
+        $this->initializeTranslator();
+        
+        $files = $this->getSourceLanguageFiles();
+        $results = [];
         
         foreach ($files as $file) {
-            $this->filePutContent($this->getTranslatedData($file), $file);
+            $results[$file->getFilename()] = $this->processFile($file);
+        }
+        
+        return $results;
+    }
+    
+    private function validateLanguages(): void
+    {
+        if (empty($this->sourceLanguage) || empty($this->targetLanguage)) {
+            throw new RuntimeException('Source and target languages must be specified');
+        }
+        
+        if ($this->sourceLanguage === $this->targetLanguage) {
+            throw new RuntimeException('Source and target languages cannot be the same');
         }
     }
     
-    private function getLocalLangFiles(): array
+    private function initializeTranslator(): void
     {
-        $this->existsLocalLangDir();
-        $this->existsLocalLangFiles();
-        
-        return $this->getFiles($this->getTranslateLocalPath());
+        $this->translator = (new GoogleTranslate())
+            ->setSource($this->sourceLanguage)
+            ->setTarget($this->targetLanguage);
     }
     
-    private function filePutContent(string $translatedData, string $file): void
+    private function getSourceLanguageFiles(): array
     {
-        $folderPath = lang_path($this->translate_to);
-        $fileName = pathinfo($file, PATHINFO_FILENAME) . '.php';
+        $sourcePath = $this->getSourceLanguagePath();
         
-        if (!File::isDirectory($folderPath)) {
-            File::makeDirectory($folderPath, 0755, true);
+        $this->validateSourceDirectory($sourcePath);
+        
+        $files = File::files($sourcePath);
+        
+        if (empty($files)) {
+            throw new RuntimeException("No language files found in '{$this->sourceLanguage}' directory");
         }
         
-        $filePath = $folderPath . DIRECTORY_SEPARATOR . $fileName;
-        File::put($filePath, $translatedData);
+        return $files;
     }
     
-    private function getTranslatedData(SplFileInfo $file): string
+    private function getSourceLanguagePath(): string
     {
-        $translatedData = var_export($this->translateLangFiles(include $file), "false");
-        return $this->addPhpSyntax($translatedData);
+        return lang_path($this->sourceLanguage);
     }
     
-    private function setUpGoogleTranslate(): GoogleTranslate
+    private function validateSourceDirectory(string $path): void
     {
-        $google = new GoogleTranslate();
-        return $google->setSource($this->translate_from)
-            ->setTarget($this->translate_to);
+        if (!File::isDirectory($path)) {
+            throw new RuntimeException(
+                "Language directory '{$this->sourceLanguage}' does not exist. " .
+                "Have you run `php artisan lang:publish` command?"
+            );
+        }
     }
     
-    private function translateLangFiles(array $content): array
+    private function processFile(SplFileInfo $file): bool
     {
-        $google = $this->setUpGoogleTranslate();
-
-        if (empty($content))
-            return [];
-
-        return $this->translateRecursive($content, $google);
-    }
-    
-    private function translateRecursive($content, $google) : array
-    {
-        $trans_data = [];
+        $translations = include $file->getPathname();
         
-        foreach ($content as $key => $value) {
-            if (is_array($value)) {
-                $trans_data[$key] = $this->translateRecursive($value, $google);
-                continue;
-            }
-
-            $hasProps = str_contains($value, ':');
-            $modifiedValue = $hasProps
-                ? preg_replace_callback(
-                    '/(:\w+)/',
-                    fn($match) => '{' . $match[0] . '}',
-                    $value
-                )
-                : $value;
-
-            $translatedValue = $google->translate($modifiedValue);
-
-            $trans_data[$key] = $hasProps
-                ? str_replace(['{', '}'], '', $translatedValue)
-                : $translatedValue;
+        if (!is_array($translations)) {
+            return false;
         }
         
-        return $trans_data;
-    }
-    
-    private function addPhpSyntax(string $translatedData): string
-    {
-        return '<?php return ' . $translatedData . ';';
-    }
-    
-    // Exceptions
-    private function existsLocalLangDir(): void
-    {
-        $path = $this->getTranslateLocalPath();
+        $translatedData = $this->translateArray($translations);
+        $phpContent = $this->generatePhpFileContent($translatedData);
         
-        throw_if(
-            !File::isDirectory($path),
-            ("lang folder $this->translate_from not Exist !" . PHP_EOL . '  Have you run `php artisan lang:publish` command before?')
+        if (!$this->dryRun) {
+            $this->saveTranslatedFile($file->getFilename(), $phpContent);
+        }
+        
+        return true;
+    }
+    
+    private function translateArray(array $data): array
+    {
+        $translated = [];
+        
+        foreach ($data as $key => $value) {
+            $translated[$key] = is_array($value) 
+                ? $this->translateArray($value) 
+                : $this->translateString($value);
+        }
+        
+        return $translated;
+    }
+    
+    private function translateString(string $text): string
+    {
+        if (isset($this->translationCache[$text])) {
+            return $this->translationCache[$text];
+        }
+        
+        $processedText = $this->preserveParameters 
+            ? $this->protectParameters($text) 
+            : $text;
+            
+        $translated = $this->translator->translate($processedText);
+        
+        if ($this->preserveParameters) {
+            $translated = $this->restoreParameters($translated);
+        }
+        
+        $this->translationCache[$text] = $translated;
+        
+        return $translated;
+    }
+    
+    private function protectParameters(string $text): string
+    {
+        return preg_replace_callback(
+            '/(:\w+)/',
+            fn($match) => '{' . $match[0] . '}',
+            $text
         );
     }
     
-    private function existsLocalLangFiles(): void
+    private function restoreParameters(string $text): string
     {
-        $files = $this->getFiles($this->getTranslateLocalPath());
+        return str_replace(['{', '}'], '', $text);
+    }
+    
+    private function generatePhpFileContent(array $data): string
+    {
+        $export = var_export($data, true);
+        return "<?php\n\nreturn {$export};";
+    }
+    
+    private function saveTranslatedFile(string $filename, string $content): void
+    {
+        $targetDir = lang_path($this->targetLanguage);
         
-        throw_if(empty($files), ("lang files in '$this->translate_from' folder not found !"));
-    }
-    
-    //helpers
-    private function getFiles(string $path = null): array
-    {
-        return File::files($path);
-    }
-    
-    private function getTranslateLocalPath(): string
-    {
-        return lang_path(DIRECTORY_SEPARATOR . $this->translate_from);
+        if (!File::isDirectory($targetDir)) {
+            File::makeDirectory($targetDir, 0755, true);
+        }
+        
+        File::put("{$targetDir}/{$filename}", $content);
     }
 }
